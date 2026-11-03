@@ -1,0 +1,15 @@
+{
+  "appId": "io.github.constela.app",
+  "appName": "Constela",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https",
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true
+  },
+  "plugins": {
+    "CapacitorHttp": { "enabled": false }
+  }
+}
