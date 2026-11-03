@@ -1,0 +1,8 @@
+node_modules/
+desktop/app/
+desktop/dist/
+mobile/www/
+mobile/android/
+*.jks
+*.keystore
+LEEME-firma-android.txt
