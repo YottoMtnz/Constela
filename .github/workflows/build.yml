@@ -1,0 +1,138 @@
+name: Compilar Constela
+
+# Cada vez que subes cambios a main se publica la web y se compilan el .exe y el .apk.
+# Si además creas una etiqueta vX.Y.Z (por ejemplo v1.0.0), se crea una «Release» con los instaladores.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: constela-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    name: Web (GitHub Pages)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: www
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  windows:
+    name: Windows (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Copiar la app web
+        shell: bash
+        run: |
+          rm -rf desktop/app
+          mkdir -p desktop/app
+          cp -r www/. desktop/app/
+      - name: Instalar y compilar
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          npm install --no-audit --no-fund
+          npm run dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Constela-Windows
+          path: desktop/dist/*.exe
+          if-no-files-found: error
+
+  android:
+    name: Android (.apk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - name: Crear el proyecto Android
+        working-directory: mobile
+        run: |
+          npm install --no-audit --no-fund
+          rm -rf www && mkdir -p www && cp -r ../www/. www/
+          npx cap add android
+          node patch-android.js
+      - name: Iconos y pantalla de inicio
+        working-directory: mobile
+        continue-on-error: true
+        run: npx --yes @capacitor/assets@3.0.5 generate --android --iconBackgroundColor "#241B2E" --iconBackgroundColorDark "#241B2E" --splashBackgroundColor "#1B1423" --splashBackgroundColorDark "#1B1423"
+      - name: Sincronizar
+        working-directory: mobile
+        run: npx cap sync android
+      - name: Llave de firma
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/firma.jks"
+            echo "KS_PASS=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=${KEY_ALIAS:-constela}" >> "$GITHUB_ENV"
+            echo "Usando tu llave de firma (los .apk nuevos se instalan encima de los anteriores)."
+          else
+            keytool -genkeypair -keystore "$RUNNER_TEMP/firma.jks" -storetype PKCS12 -alias constela -keyalg RSA -keysize 2048 -validity 10000 -storepass constela-temporal -keypass constela-temporal -dname "CN=Constela"
+            echo "KS_PASS=constela-temporal" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=constela" >> "$GITHUB_ENV"
+            echo "::warning::Sin llave propia: para actualizar la app tendrás que desinstalar la anterior. Mira el README (sección Firma)."
+          fi
+      - name: Compilar APK
+        working-directory: mobile/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/firma.jks" \
+            -Pandroid.injected.signing.store.password="$KS_PASS" \
+            -Pandroid.injected.signing.key.alias="$KS_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KS_PASS" \
+          && cp app/build/outputs/apk/release/app-release.apk ../../Constela-Android.apk \
+          || { echo "::warning::La versión firmada falló; compilo la de depuración."; ./gradlew assembleDebug --no-daemon && cp app/build/outputs/apk/debug/app-debug.apk ../../Constela-Android.apk; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Constela-Android
+          path: Constela-Android.apk
+          if-no-files-found: error
+
+  release:
+    name: Publicar versión
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
