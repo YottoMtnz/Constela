@@ -763,7 +763,8 @@ async function fetchT(url, opts = {}, ms = 30000) {
   const t = setTimeout(() => ctl.abort(new DOMException("Tiempo de espera agotado", "TimeoutError")), ms);
   const outer = opts.signal; const onAbort = () => ctl.abort(outer.reason);
   if (outer) { if (outer.aborted) ctl.abort(outer.reason); else outer.addEventListener("abort", onAbort, { once: true }); }
-  try { return await fetch(url, { ...opts, signal: ctl.signal }); }
+  const { connectTimeout, ...fopts } = opts;
+  try { return await fetch(url, { ...fopts, signal: ctl.signal }); }
   catch (e) {
     if (outer?.aborted) throw new DOMException("Detenido", "AbortError");
     if (e?.name === "AbortError" || e?.name === "TimeoutError") { const er = new Error("Tiempo de espera agotado"); er.timeout = true; throw er; }
@@ -1003,12 +1004,70 @@ async function fetchBlob(url) {
     throw e;
   }
 }
+/* ---------- red para los modelos: salta CORS en Windows y Android ---------- */
+const _desktopStreams = new Map();
+const _nativeHosts = new Set(LS.get("muse.nativeHosts", []));
+/** Petición hecha por el sistema (sin CORS). Devuelve un Response normal. */
+async function nativeFetch(url, opts = {}) {
+  const method = opts.method || "GET"; const headers = opts.headers || {};
+  if (PLATFORM === "windows" && window.desktop.streamFetch) {
+    const id = uid(); let ctrl;
+    const stream = new ReadableStream({ start(c) { ctrl = c; }, cancel() { window.desktop.abortStream(id); } });
+    _desktopStreams.set(id, ctrl);
+    opts.signal?.addEventListener("abort", () => { window.desktop.abortStream(id); try { ctrl.error(new DOMException("Detenido", "AbortError")); } catch (e) {} _desktopStreams.delete(id); }, { once: true });
+    let head;
+    try { head = await window.desktop.streamFetch(id, url, { method, headers, body: typeof opts.body === "string" ? opts.body : undefined, connectTimeout: opts.connectTimeout || 30000 }); }
+    catch (e) { _desktopStreams.delete(id); const er = new Error("Sin conexión con " + new URL(url).host + ": " + (e.message || e)); er.network = true; throw er; }
+    return new Response([204, 205, 304].includes(head.status) ? null : stream, { status: head.status, headers: head.headers });
+  }
+  if (PLATFORM === "android") {
+    const H = capPlugin("CapacitorHttp");
+    let data = opts.body; if (typeof data === "string" && /json/i.test(headers["Content-Type"] || headers["content-type"] || "")) { try { data = JSON.parse(data); } catch (e) {} }
+    let r;
+    try { r = await H.request({ url, method, headers, data, responseType: "text", connectTimeout: opts.connectTimeout || 20000, readTimeout: 600000 }); }
+    catch (e) { const er = new Error("Sin conexión con " + new URL(url).host + ": " + (e.message || e)); er.network = true; throw er; }
+    if (opts.signal?.aborted) throw new DOMException("Detenido", "AbortError");
+    const body = typeof r.data === "string" ? r.data : JSON.stringify(r.data ?? "");
+    return new Response([204, 205, 304].includes(r.status) ? null : body, { status: r.status || 200, headers: r.headers || {} });
+  }
+  throw new Error("Sin red nativa en la web");
+}
+/** fetch para los proveedores: normal y, si el sistema la bloquea (CORS), por la red nativa. */
+async function netFetch(url, opts = {}, ms = 30000) {
+  const host = new URL(url).host;
+  if (PLATFORM !== "web" && _nativeHosts.has(host)) return nativeFetch(url, opts);
+  try { return await fetchT(url, opts, ms); }
+  catch (e) {
+    if (!e.network || opts.signal?.aborted) throw e;
+    if (PLATFORM !== "web") {
+      const r = await nativeFetch(url, opts);
+      _nativeHosts.add(host); LS.set("muse.nativeHosts", [..._nativeHosts]);
+      return r;
+    }
+    // En la web: reintento como petición «simple» (sin cabeceras especiales), que el navegador no bloquea por CORS.
+    if ((opts.method || "GET") === "POST") {
+      try { const r = await fetchT(url, { ...opts, headers: { "Content-Type": "text/plain;charset=UTF-8" } }, ms); if (r.status !== 415) return r; } catch (e2) { if (opts.signal?.aborted) throw e2; }
+    }
+    const er = new Error(navigator.onLine === false ? "Sin conexión a internet" : `${host} no permite conexiones desde páginas web (CORS). En la app de Windows o Android sí funciona.`);
+    er.network = true; er.cors = true; throw er;
+  }
+}
 /** Abre un enlace fuera de la app (navegador del sistema). */
 function openExternal(url) {
   if (PLATFORM === "android") { const a = h("a", { href: url, target: "_blank", rel: "noopener" }); document.body.append(a); a.click(); a.remove(); return; }
   window.open(url, "_blank", "noopener");
 }
 function platformInit() {
+  if (PLATFORM === "windows" && window.desktop.onStream) {
+    window.desktop.onStream((m) => {
+      const c = _desktopStreams.get(m.id); if (!c) return;
+      try {
+        if (m.chunk) c.enqueue(m.chunk instanceof Uint8Array ? m.chunk : new Uint8Array(m.chunk));
+        if (m.done) { c.close(); _desktopStreams.delete(m.id); }
+        if (m.error) { c.error(Object.assign(new Error(m.error), { network: true })); _desktopStreams.delete(m.id); }
+      } catch (e) {}
+    });
+  }
   if (PLATFORM === "android") {
     const App = capPlugin("App");
     App?.addListener?.("backButton", () => {
@@ -1032,7 +1091,7 @@ function platformInit() {
 
 /* ---------- streaming estilo OpenAI (Pollinations, LLM7, OVH, servidores locales) ---------- */
 async function* openaiCompat({ url, headers = {}, body, signal, where, timeout = 120000 }) {
-  const r = await fetchT(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body), signal }, timeout);
+  const r = await netFetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body), signal }, timeout);
   if (!r.ok) throw new HttpError(r.status, await r.text().catch(() => ""), where);
   const ct = r.headers.get("content-type") || "";
   if (!/event-stream/.test(ct)) {
@@ -1077,7 +1136,7 @@ async function* openaiCompat({ url, headers = {}, body, signal, where, timeout =
 }
 
 async function listOpenAIModels(url, headers = {}, ms = 10000) {
-  const r = await fetchT(url, { headers }, ms);
+  const r = await netFetch(url, { headers }, ms);
   if (!r.ok) throw new HttpError(r.status, await r.text().catch(() => ""), new URL(url).host);
   const j = await r.json(); const arr = Array.isArray(j) ? j : (j.data || j.models || []);
   return arr.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id });
@@ -1255,7 +1314,7 @@ const PROVIDERS = {
     toolMode: (m) => (m?.tools === false ? "text" : "native"), vision: (m) => !!m?.vision || /openai|gemini|claude/.test(m?.id || ""),
     async status() { return { ok: true, label: "listo" }; },
     async list() {
-      const r = await fetchT("https://text.pollinations.ai/models", {}, 12000);
+      const r = await netFetch("https://text.pollinations.ai/models", {}, 12000);
       if (!r.ok) throw new HttpError(r.status, await r.text(), "Pollinations");
       const j = await r.json(); const arr = Array.isArray(j) ? j : (j.data || j.models || []);
       return arr.map((m) => typeof m === "string" ? { id: m, name: m } : {
@@ -1289,7 +1348,7 @@ const PROVIDERS = {
     async *chat(req) {
       const body = { model: req.model, messages: req.messages, stream: true, temperature: req.temperature };
       if (req.tools?.length) body.tools = req.tools;
-      yield* openaiCompat({ url: "https://api.llm7.io/v1/chat/completions", headers: { Authorization: "Bearer unused" }, body, signal: req.signal, where: "LLM7" });
+      yield* openaiCompat({ url: "https://api.llm7.io/v1/chat/completions", body, signal: req.signal, where: "LLM7" });
     },
   },
 
@@ -1313,7 +1372,7 @@ const PROVIDERS = {
     toolMode: () => "text", vision: () => false,
     async status() { return { ok: true, label: "cola" }; },
     async list() {
-      const r = await fetchT("https://aihorde.net/api/v2/status/models?type=text", { headers: { "Client-Agent": "muse-local:2.0:anon" } }, 12000);
+      const r = await netFetch("https://aihorde.net/api/v2/status/models?type=text", { headers: { "Client-Agent": "muse-local:2.0:anon" } }, 12000);
       if (!r.ok) throw new HttpError(r.status, await r.text(), "AI Horde");
       const j = await r.json();
       return [{ id: "*", name: "Cualquiera disponible (el más rápido)", tags: ["auto"] }].concat(
@@ -1322,14 +1381,14 @@ const PROVIDERS = {
     async *chat({ model, prompt, temperature, signal, info }) {
       const headers = { "Content-Type": "application/json", apikey: "0000000000", "Client-Agent": "muse-local:2.0:anon" };
       const body = { prompt, params: { max_length: 512, max_context_length: 4096, temperature: temperature ?? 0.7, stop_sequence: ["\nUsuario:", "\nUser:", "<|im_end|>"] }, models: model && model !== "*" ? [model] : [] };
-      const r = await fetchT("https://aihorde.net/api/v2/generate/text/async", { method: "POST", headers, body: JSON.stringify(body), signal }, 30000);
+      const r = await netFetch("https://aihorde.net/api/v2/generate/text/async", { method: "POST", headers, body: JSON.stringify(body), signal }, 30000);
       if (!r.ok) throw new HttpError(r.status, await r.text(), "AI Horde");
       const { id } = await r.json();
       const cancel = () => fetch("https://aihorde.net/api/v2/generate/text/status/" + id, { method: "DELETE", headers }).catch(() => {});
       signal?.addEventListener("abort", cancel, { once: true });
       for (let i = 0; i < 200; i++) {
         await sleep(i < 3 ? 2000 : 3500, signal);
-        const s = await (await fetchT("https://aihorde.net/api/v2/generate/text/status/" + id, { headers, signal }, 20000)).json();
+        const s = await (await netFetch("https://aihorde.net/api/v2/generate/text/status/" + id, { headers, signal }, 20000)).json();
         if (s.faulted) throw new Error("AI Horde: la generación falló");
         if (s.is_possible === false) { cancel(); const e = new Error("AI Horde: ningún worker sirve ese modelo ahora"); e.status = 503; throw e; }
         if (s.done) { info?.(""); const t = s.generations?.[0]?.text || ""; if (t) yield { type: "text", text: t }; return; }
@@ -1344,11 +1403,11 @@ const PROVIDERS = {
     desc: "Tus modelos de Ollama y sus modelos en la nube (:cloud) sin API key: en tu PC ejecuta «ollama signin» una vez y elige un modelo :cloud. Para que el navegador pueda hablar con Ollama, arráncalo con OLLAMA_ORIGINS=\"*\".",
     toolMode: () => "native", vision: (m) => /vl|vision|llava|gemma3|minicpm-v|moondream|kimi-k2\.5/.test(m?.id || ""),
     base() { return (S.settings.providers.ollama.url || "http://localhost:11434").replace(/\/+$/, ""); },
-    async status() { try { const r = await fetchT(this.base() + "/api/version", {}, 2500); return r.ok ? { ok: true, label: "detectado" } : { ok: false, label: "no detectado" }; } catch (e) { return { ok: false, label: "no detectado" }; } },
+    async status() { try { const r = await netFetch(this.base() + "/api/version", { connectTimeout: 2500 }, 2500); return r.ok ? { ok: true, label: "detectado" } : { ok: false, label: "no detectado" }; } catch (e) { return { ok: false, label: "no detectado" }; } },
     async list() {
       let local = [], err = null;
       try {
-        const r = await fetchT(this.base() + "/api/tags", {}, 5000); const j = await r.json();
+        const r = await netFetch(this.base() + "/api/tags", { connectTimeout: 4000 }, 5000); const j = await r.json();
         local = (j.models || []).map((m) => ({ id: m.name, name: m.name, tags: [/cloud/.test(m.name) ? "nube" : "local"], note: [m.details?.parameter_size, m.details?.quantization_level].filter(Boolean).join(" · ") }));
       } catch (e) { err = e; }
       const cloud = OLLAMA_CLOUD.filter((id) => !local.some((m) => m.id === id)).map((id) => ({ id, name: id, tags: ["nube"], note: "requiere «ollama signin» en tu PC" }));
@@ -1359,7 +1418,7 @@ const PROVIDERS = {
       const body = { model, messages, stream: true, options: { temperature } };
       if (!/cloud/.test(model)) body.options.num_ctx = 8192;
       if (tools?.length) body.tools = tools;
-      const r = await fetchT(this.base() + "/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal }, 600000);
+      const r = await netFetch(this.base() + "/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal }, 600000);
       if (!r.ok) throw new HttpError(r.status, await r.text(), "Ollama");
       const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
       try {
@@ -1386,7 +1445,7 @@ const PROVIDERS = {
     desc: "LM Studio, llama.cpp, Jan, vLLM, LocalAI o cualquier servidor compatible con OpenAI en tu red, sin clave. LM Studio usa por defecto http://localhost:1234/v1 (activa CORS en su servidor).",
     toolMode: () => "native", vision: () => true,
     base() { return (S.settings.providers.local.url || "http://localhost:1234/v1").replace(/\/+$/, ""); },
-    async status() { try { const r = await fetchT(this.base() + "/models", {}, 2500); return r.ok ? { ok: true, label: "detectado" } : { ok: false, label: "no detectado" }; } catch (e) { return { ok: false, label: "no detectado" }; } },
+    async status() { try { const r = await netFetch(this.base() + "/models", { connectTimeout: 2500 }, 2500); return r.ok ? { ok: true, label: "detectado" } : { ok: false, label: "no detectado" }; } catch (e) { return { ok: false, label: "no detectado" }; } },
     async list() { return (await listOpenAIModels(this.base() + "/models", {}, 5000)).map((m) => ({ ...m, tags: ["local"] })); },
     async *chat(req) {
       const body = { model: req.model, messages: req.messages, stream: true, temperature: req.temperature };
@@ -2374,6 +2433,7 @@ function stepContent(m, streaming) {
   if (m.error) frag.append(h("div", { class: "notice err" }, h("span", { class: "x" }, m.error),
     m.errorAction === "puter" ? h("button", { onclick: () => Puter.signIn().then(() => regenerate()).catch((e) => toast(e.message, { err: true })) }, "Conectar Puter") :
     m.errorAction === "bridge" ? h("button", { onclick: () => openSettings("perchance") }, "Configurar Perchance") :
+    m.errorAction === "continue" ? h("button", { onclick: () => continueReply() }, "Continuar") :
     h("button", { onclick: () => openPicker() }, "Cambiar de modelo")));
   return frag;
 }
@@ -2717,8 +2777,16 @@ async function runAgent({ chat, msgs, chain, signal, route, extraSys = "", headl
     let calls = [];
     try { calls = await streamStep({ msg, msgs, sel, prov, minfo, tmode, toolNames, signal, extraSys, headless, onProgress }); }
     catch (e) {
-      if (signal.aborted || e?.name === "AbortError") { msg.stopped = true; msg.info = ""; break; }
+      if (signal.aborted) { msg.stopped = true; msg.info = ""; break; }
+      // Un corte que no pediste no es «detenido»: es un fallo de conexión.
+      if (e?.name === "AbortError") e = Object.assign(new Error("La conexión se cortó a mitad de la respuesta"), { network: true });
       console.warn("Fallo de", key, e);
+      if (e.cors) _status[sel.p] = { ok: false, label: "sólo en la app", ts: Date.now() + 864e5 };
+      // Si ya escribió bastante, no lo tiro: lo dejo y ofrezco continuar.
+      if ((msg.content || "").trim().length > 300) {
+        msg.info = ""; msg.ms = Date.now() - msg.ts; msg.error = `Se cortó la respuesta de ${msg.model.name} (${prov.name}): ${shortErr(e)}`; msg.errorAction = "continue";
+        await finalizeMsg(chat, msg); break;
+      }
       if (tmode === "native" && isToolsUnsupported(e)) { S.noNative[key] = true; LS.set("muse.noNative", S.noNative); msgs.pop(); notices.push(...(msg.notices || [])); step--; continue; }
       if (S.settings.failover !== false && ci < chain.length - 1 && isRetryable(e)) {
         const next = chain[ci + 1];
@@ -2826,7 +2894,7 @@ Con todo esto, da al usuario la respuesta final: completa, ordenada y sin repeti
 /* ---------- punto de entrada de cada turno ---------- */
 async function runTurn() {
   const chat = S.chat; if (!chat || S.busy) return;
-  S.busy = true; S.abort = new AbortController(); setBusyUI(true);
+  S.busy = true; S.busySince = Date.now(); S.abort = new AbortController(); setBusyUI(true);
   const signal = S.abort.signal;
   try {
     const userMsg = [...chat.messages].reverse().find((m) => m.role === "user");
@@ -2846,6 +2914,11 @@ async function runTurn() {
     if (chat.title === "Nuevo chat") { const u = chat.messages.find((m) => m.role === "user"); if (u) chat.title = trunc((u.content || u.atts?.[0]?.name || "Chat").replace(/\s+/g, " ").trim(), 48); }
     await saveChat(chat); if (S.chat === chat) { renderThread(); $("#chatTitle").value = chat.title; } renderChatList();
   }
+}
+function continueReply() {
+  if (S.busy || !S.chat) return;
+  S.chat.messages.push({ id: uid(), role: "user", content: "Continúa exactamente donde te quedaste, sin repetir lo que ya escribiste. Si estabas escribiendo un archivo, vuelve a crearlo completo.", ts: Date.now() });
+  renderThread({ forceBottom: true }); runTurn();
 }
 function regenerate() {
   if (S.busy || !S.chat) return;
@@ -2989,7 +3062,7 @@ async function handleFiles(files) {
   }
 }
 async function send() {
-  if (S.busy) { S.abort?.abort(); return; }
+  if (S.busy) { if (Date.now() - (S.busySince || 0) > 1200) S.abort?.abort(); return; }
   const text = $("#input").value.trim(); const atts = S.pendingAtts.filter((a) => !a.loading);
   if (!text && !atts.length) return;
   if (!S.chat) newChat();
