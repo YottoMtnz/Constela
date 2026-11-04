@@ -8,7 +8,9 @@ const path = require("path");
 const fs = require("fs");
 const { pathToFileURL } = require("url");
 
-const APP_DIR = path.join(__dirname, "app");
+// La carpeta www/ trae la pagina de presentacion en la raiz y la app en app/:
+// se sirve la app desde app/app para que app://constela/index.html sea el chat.
+const APP_DIR = path.join(__dirname, "app", "app");
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 
 protocol.registerSchemesAsPrivileged([
