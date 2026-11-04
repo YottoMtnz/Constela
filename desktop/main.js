@@ -79,6 +79,27 @@ app.whenReady().then(() => {
     const text = await r.text();
     return { status: r.status, url: r.url, text: text.slice(0, 5_000_000) };
   });
+  // Peticiones de los modelos sin CORS, con la respuesta en vivo (streaming) hacia la app.
+  const streams = new Map();
+  ipcMain.handle("stream-fetch", async (e, { id, url, opts }) => {
+    if (!/^https?:\/\//i.test(url)) throw new Error("URL no válida");
+    const ctl = new AbortController(); streams.set(id, ctl);
+    const to = setTimeout(() => ctl.abort(), (opts && opts.connectTimeout) || 30000);
+    let r;
+    try { r = await net.fetch(url, { method: opts.method || "GET", headers: opts.headers || {}, body: opts.body, signal: ctl.signal }); }
+    catch (err) { streams.delete(id); throw err; }
+    finally { clearTimeout(to); }
+    const sender = e.sender;
+    (async () => {
+      try {
+        if (r.body) { const reader = r.body.getReader(); for (;;) { const { value, done } = await reader.read(); if (done) break; if (!sender.isDestroyed()) sender.send("stream-ev", { id, chunk: value }); } }
+        if (!sender.isDestroyed()) sender.send("stream-ev", { id, done: true });
+      } catch (err) { if (!sender.isDestroyed()) sender.send("stream-ev", { id, error: String((err && err.message) || err) }); }
+      finally { streams.delete(id); }
+    })();
+    return { status: r.status, headers: Object.fromEntries(r.headers.entries()) };
+  });
+  ipcMain.handle("stream-abort", (_e, id) => { const c = streams.get(id); if (c) { c.abort(); streams.delete(id); } });
   ipcMain.handle("fetch-binary", async (_e, { url }) => {
     if (!/^https?:\/\//i.test(url)) throw new Error("URL no válida");
     const r = await net.fetch(url, { headers: { "User-Agent": UA } });
